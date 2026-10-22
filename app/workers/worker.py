@@ -6,18 +6,23 @@ Worker يشتغل بـ asyncio:
 - ينفّذها مع Retry Logic
 - يبعت النتائج + Heartbeat + Leader Election
 - المهام الفاشلة تروح لـ DLQ
+- ✅ يحدّث DB: status + worker_id + started_at + finished_at
 """
 import asyncio
 import json
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
+
 import redis.asyncio as aioredis
 
 from app.workers.heartbeat import Heartbeat
 from app.workers.election import LeaderElection
 from app.distributed.retry import RetryPolicy, retry_async, calculate_delay
 from app.distributed.dlq import DeadLetterQueue
+from app.db.session import SessionLocal
+from app.db.models import Task, TaskStatus
 
 
 # القنوات والمفاتيح
@@ -28,11 +33,12 @@ EVENTS_CHANNEL = "tasks:events"
 class Worker:
     """
     Worker واحد.
-    
+
     - معرّف فريد (worker-xxxx)
     - يستقبل مهام من Redis List (BRPOP)
     - ينفّذها مع Retry Logic
     - المهام الفاشلة تروح لـ DLQ
+    - يحدّث حالة المهام في DB (running / completed / failed)
     """
 
     def __init__(
@@ -56,6 +62,8 @@ class Worker:
         self.tasks_failed = 0
         self.tasks_retried = 0
 
+    # ==================== Events ====================
+
     async def _publish_event(self, event_type: str, data: dict):
         """يبعت حدث على Redis Pub/Sub"""
         payload = {
@@ -65,6 +73,69 @@ class Worker:
             **data,
         }
         await self.redis.publish(EVENTS_CHANNEL, json.dumps(payload))
+
+    # ==================== DB Tracking ====================
+
+    async def _mark_task_running(self, task_id: int):
+        """يحدّث الحالة لـ running + worker_id + started_at"""
+
+        def _do():
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    task.status = TaskStatus.running.value
+                    task.worker_id = self.worker_id
+                    task.started_at = datetime.utcnow()
+                    db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"[{self.worker_id}] DB running update failed: {e}")
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_do)
+
+    async def _mark_task_completed(self, task_id: int):
+        """يحدّث الحالة لـ completed + finished_at"""
+
+        def _do():
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    task.status = TaskStatus.completed.value
+                    task.finished_at = datetime.utcnow()
+                    db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"[{self.worker_id}] DB completed update failed: {e}")
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_do)
+
+    async def _mark_task_failed(self, task_id: int):
+        """يحدّث الحالة لـ failed + finished_at"""
+
+        def _do():
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    task.status = TaskStatus.failed.value
+                    task.finished_at = datetime.utcnow()
+                    db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"[{self.worker_id}] DB failed update failed: {e}")
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_do)
+
+    # ==================== Execution ====================
+
     async def _execute_task_once(self, task: dict) -> bool:
         """
         محاولة واحدة لتنفيذ المهمة.
@@ -133,6 +204,8 @@ class Worker:
             self.tasks_failed += 1
             return False
 
+    # ==================== Loop ====================
+
     async def _task_loop(self):
         """حلقة استقبال المهام"""
         print(f"[{self.worker_id}] Task loop started. Waiting for tasks...")
@@ -149,14 +222,36 @@ class Worker:
                     print(f"[{self.worker_id}] Invalid task JSON: {raw}")
                     continue
 
+                # ✅ سجّلي إنك بديتي تنفذي المهمة
+                task_id_raw = task.get("task_id")
+                task_id_int: Optional[int] = None
+                if task_id_raw is not None:
+                    try:
+                        task_id_int = int(task_id_raw)
+                    except (ValueError, TypeError):
+                        print(f"[{self.worker_id}] Invalid task_id in payload: {task_id_raw}")
+                        task_id_int = None
+
+                if task_id_int is not None:
+                    await self._mark_task_running(task_id_int)
+
                 print(f"[{self.worker_id}] 📥 Executing: {task.get('name')}")
-                await self._execute_task(task)
+                success = await self._execute_task(task)
+
+                # ✅ سجّلي النتيجة
+                if task_id_int is not None:
+                    if success:
+                        await self._mark_task_completed(task_id_int)
+                    else:
+                        await self._mark_task_failed(task_id_int)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"[{self.worker_id}] Task loop error: {e}")
                 await asyncio.sleep(1)
+
+    # ==================== Lifecycle ====================
 
     async def start(self):
         """يشغّل الـ Worker"""
