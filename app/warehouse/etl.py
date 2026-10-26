@@ -11,7 +11,6 @@ Extract-Transform-Load
 """
 import asyncio
 from datetime import datetime
-from typing import Optional
 
 import redis.asyncio as aioredis
 from sqlalchemy.orm import Session
@@ -25,7 +24,9 @@ from app.warehouse.models import (
     DimTime,
     FactTaskExecution,
 )
+from app.core.logging import get_logger
 
+logger = get_logger(__name__)
 
 LAST_TASK_ID_KEY = "warehouse:last_task_id"
 
@@ -119,8 +120,6 @@ def _get_or_create_dim_time(db: Session, dt: datetime) -> int:
 def _compute_durations(task: Task) -> tuple:
     """
     يرجع (execution_time, total_time) بالثواني.
-    - execution_time: مدة المهمة الفعلية (duration)
-    - total_time: الوقت الحقيقي من started_at إلى finished_at (لو متوفر)
     """
     execution_time = float(task.duration or 0.0)
 
@@ -142,7 +141,6 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
         last_id_raw = await redis.get(LAST_TASK_ID_KEY)
         last_id = int(last_id_raw) if last_id_raw else 0
 
-        # جلب فقط المهام المكتملة/الفاشلة الجديدة
         tasks = (
             db.query(Task)
             .filter(Task.id > last_id)
@@ -157,7 +155,6 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
         for task in tasks:
             dim_task_id = _get_or_create_dim_task(db, task)
 
-            # تحقق إذا موجود في fact
             existing = (
                 db.query(FactTaskExecution)
                 .filter(FactTaskExecution.task_id == dim_task_id)
@@ -169,11 +166,9 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
                 max_id = max(max_id, task.id)
                 continue
 
-            # ✅ worker_id الحقيقي من DB (مو placeholder)
             real_worker = task.worker_id or "unknown-worker"
             dim_worker_id = _get_or_create_dim_worker(db, real_worker)
 
-            # ✅ status كـ string نظيف (مو enum)
             status_value = (
                 task.status.value
                 if hasattr(task.status, "value")
@@ -181,11 +176,9 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
             )
             dim_status_id = _get_or_create_dim_status(db, status_value)
 
-            # ✅ وقت التنفيذ الفعلي
             time_ref = task.finished_at or task.created_at or datetime.utcnow()
             dim_time_id = _get_or_create_dim_time(db, time_ref)
 
-            # ✅ حساب الأوقات الحقيقية
             execution_time, total_time = _compute_durations(task)
 
             fact = FactTaskExecution(
@@ -209,7 +202,7 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
 
     except Exception as e:
         db.rollback()
-        print(f"❌ ETL error: {e}", flush=True)
+        logger.error(f"etl_error error={e}")
         raise
     finally:
         db.close()
@@ -219,20 +212,19 @@ async def run_etl_once(redis: aioredis.Redis) -> dict:
 
 async def etl_worker(redis: aioredis.Redis, interval_seconds: int = 60):
     """ETL Job يعمل كل `interval_seconds` ثانية."""
-    print(f"🔄 ETL worker started (every {interval_seconds}s)", flush=True)
+    logger.info(f"etl_worker_started interval={interval_seconds}")
 
     while True:
         try:
             await asyncio.sleep(interval_seconds)
             stats = await run_etl_once(redis)
             if stats["inserted"] > 0 or stats["scanned"] > 0:
-                print(
-                    f"✅ ETL: scanned={stats['scanned']}, "
-                    f"inserted={stats['inserted']}, skipped={stats['skipped']}",
-                    flush=True,
+                logger.info(
+                    f"etl_run scanned={stats['scanned']} "
+                    f"inserted={stats['inserted']} skipped={stats['skipped']}"
                 )
         except asyncio.CancelledError:
-            print("🔄 ETL worker stopped", flush=True)
+            logger.info("etl_worker_stopped")
             break
         except Exception as e:
-            print(f"❌ ETL worker error: {e}", flush=True)
+            logger.error(f"etl_worker_error error={e}")

@@ -10,7 +10,7 @@ import asyncio
 import sys
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -39,7 +39,7 @@ else TaskStatus.failed.value
                 period=random.choice([10.0, 15.0, 20.0]),
                 deadline=random.choice([5.0, 8.0, 10.0]),
                 status=status,
-                created_at=datetime.utcnow() - timedelta(minutes=random.randint(1, 120)),
+created_at=datetime.now(timezone.utc) - timedelta(minutes=random.randint(1, 120)),
             )
             db.add(task)
             count += 1

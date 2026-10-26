@@ -8,11 +8,16 @@ import asyncio
 import signal
 import sys
 
+from app.core.logging import setup_logging, get_logger
 from app.core.redis_client import redis_client, close_redis
 from app.workers.worker import Worker
 
+logger = get_logger(__name__)
+
 
 async def main():
+    setup_logging("INFO")
+
     worker_id = sys.argv[1] if len(sys.argv) > 1 else None
     worker = Worker(redis_client, worker_id=worker_id)
 
@@ -20,24 +25,19 @@ async def main():
     stop_event = asyncio.Event()
 
     def _signal_handler():
-        print(f"\n[{worker.worker_id}] Received shutdown signal")
+        logger.info(f"received_shutdown_signal worker_id={worker.worker_id}")
         stop_event.set()
 
-    # التعامل مع Ctrl+C
     try:
         loop.add_signal_handler(signal.SIGINT, _signal_handler)
         loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     except NotImplementedError:
-        # Windows ما بيدعم add_signal_handler
         pass
 
-    # شغّل الـ Worker في task منفصل
     worker_task = asyncio.create_task(worker.start())
 
-    # انتظر إشارة الإيقاف
     await stop_event.wait()
 
-    # إيقاف نظيف
     worker_task.cancel()
     try:
         await worker_task
@@ -46,11 +46,11 @@ async def main():
 
     await worker.stop()
     await close_redis()
-    print(f"[{worker.worker_id}] Shutdown complete.")
+    logger.info(f"shutdown_complete worker_id={worker.worker_id}")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        logger.info("interrupted_by_user")

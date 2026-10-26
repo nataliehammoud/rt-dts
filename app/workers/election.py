@@ -1,25 +1,34 @@
 """
 Leader Election
 ===============
-قيادة واحدة فقط، مع تجديد TTL آمن.
-يتعامل مع decode_responses سواء True أو False.
+قيادة واحدة فقط، مع تجديد TTL ذري (Lua script).
 """
 import asyncio
 import redis.asyncio as aioredis
 
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 LEADER_KEY = "workers:leader"
-LEADER_TTL = 10        # ثواني
-RENEW_INTERVAL = 5     # ثواني
+LEADER_TTL = 10
+RENEW_INTERVAL = 5
 
+RENEW_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
 
-def _as_str(value) -> str | None:
-    """يرجع str سواء كان bytes أو str (يتعامل مع decode_responses)."""
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.decode()
-    return str(value)
+RELEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+"""
 
 
 class LeaderElection:
@@ -28,7 +37,7 @@ class LeaderElection:
         self.worker_id = worker_id
         self.is_leader = False
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task = None
 
     async def _try_acquire(self) -> bool:
         acquired = await self.redis.set(
@@ -36,38 +45,26 @@ class LeaderElection:
         )
         if acquired:
             self.is_leader = True
-            print(f"[{self.worker_id}] ✅ Acquired leadership", flush=True)
+            logger.info(f"leader_acquired worker_id={self.worker_id}")
         return bool(acquired)
 
     async def _renew(self) -> bool:
-        """
-        FIX: جدّدي TTL فقط إذا لسا إنتي الـ leader.
-        يشتغل مع bytes و str (decode_responses=True أو False).
-        """
-        try:
-            current = await self.redis.get(LEADER_KEY)
-            current_str = _as_str(current)
-            if current_str == self.worker_id:
-                await self.redis.expire(LEADER_KEY, LEADER_TTL)
-                return True
-            return False
-        except Exception as e:
-            print(f"[{self.worker_id}] ⚠️ _renew error: {e}", flush=True)
-            return False
+        result = await self.redis.eval(
+            RENEW_SCRIPT, 1, LEADER_KEY, self.worker_id, LEADER_TTL
+        )
+        return int(result) == 1
 
     async def _renew_loop(self):
         while self._running:
             try:
                 if self.is_leader:
                     if not await self._renew():
-                        print(f"[{self.worker_id}] ⚠️ Lost leadership", flush=True)
+                        logger.warning(f"leader_lost worker_id={self.worker_id}")
                         self.is_leader = False
-                        # حاولي فورًا تعيدي الاستحواذ
-                        await self._try_acquire()
                 else:
                     await self._try_acquire()
             except Exception as e:
-                print(f"[{self.worker_id}] Election error: {e}", flush=True)
+                logger.error(f"election_error worker_id={self.worker_id} error={e}")
             await asyncio.sleep(RENEW_INTERVAL)
 
     async def start(self):
@@ -85,11 +82,6 @@ class LeaderElection:
             self._task = None
 
         if self.is_leader:
-            try:
-                current = await self.redis.get(LEADER_KEY)
-                if _as_str(current) == self.worker_id:
-                    await self.redis.delete(LEADER_KEY)
-                    print(f"[{self.worker_id}] 👋 Released leadership cleanly", flush=True)
-            except Exception as e:
-                print(f"[{self.worker_id}] Release error: {e}", flush=True)
+            await self.redis.eval(RELEASE_SCRIPT, 1, LEADER_KEY, self.worker_id)
+            logger.info(f"leader_released worker_id={self.worker_id}")
         self.is_leader = False
