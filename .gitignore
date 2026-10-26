@@ -57,3 +57,5 @@ build/
 # Accidental outputs
 # ============================================
 curl
+# ML model files
+app/ml/*.joblib
