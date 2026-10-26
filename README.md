@@ -1,6 +1,6 @@
 # RT-DTS: Real-Time Distributed Task Scheduler
 
-A distributed task scheduling system built with FastAPI, Redis, MySQL, and React. Implements real-time scheduling algorithms (RM and EDF), distributed worker coordination with leader election, fault tolerance via retry and dead letter queues, and an analytics data warehouse.
+A distributed task scheduling system built with FastAPI, Redis, MySQL, and React. Implements real-time scheduling algorithms (RM and EDF), distributed worker coordination with leader election, fault tolerance via retry and dead letter queues, an analytics data warehouse, and machine learning for duration prediction and anomaly detection.
 
 ## Overview
 
@@ -101,22 +101,33 @@ Each worker runs as an independent Docker container with its own process. The wo
 
 Proof: stopping the API container leaves all workers running. Stopping the leader worker triggers a new leader election within ten seconds.
 
-### Leader Election with Safe TTL Renewal
+### Leader Election with Atomic TTL Renewal
 
 A common bug in Redis-based leader election is that every worker renews the TTL, not just the leader. This causes race conditions and potential split-brain scenarios.
 
-The fix verifies identity before renewing:
+The fix uses a Lua script that atomically checks ownership and renews in a single operation:
 
 ```python
+RENEW_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
 async def _renew(self):
-    current = await self.redis.get(LEADER_KEY)
-    if current and as_string(current) == self.worker_id:
-        await self.redis.expire(LEADER_KEY, LEADER_TTL)
-        return True
-    return False
+    result = await self.redis.eval(
+        RENEW_SCRIPT, 1, LEADER_KEY, self.worker_id, LEADER_TTL
+    )
+    return int(result) == 1
 ```
 
-Only the current leader renews its lease. Other workers attempt to acquire the lock. No overlap occurs.
+Only the current leader renews its lease, and the operation is atomic. Release uses a similar script so a stale leader cannot delete someone else's lock.
+
+### Stuck Task Cleanup
+
+If a worker crashes after marking a task as `running`, the task would otherwise stay in that state forever. A background job runs every sixty seconds and moves any task that has been `running` for more than five minutes to `failed` with a `finished_at` timestamp. The API exposes this as a coroutine started alongside the ETL worker.
 
 ### Scheduling Algorithms
 
@@ -126,7 +137,7 @@ Source code is in `app/scheduler/`. Fourteen unit tests cover the algorithms.
 
 ### Accurate ETL Pipeline
 
-Workers write `worker_id`, `started_at`, and `finished_at` to the tasks table during execution. The ETL job reads these values every sixty seconds and loads them into a star schema:
+Workers write `worker_id`, `started_at`, and `finished_at` to the tasks table during execution. The ETL job reads these values every thirty seconds and loads them into a star schema:
 
 ```text
 dim_task     +
@@ -136,6 +147,27 @@ dim_time     +
 ```
 
 Every fact row reflects a real task execution by a real worker.
+
+### AI Layer
+
+Two machine learning models analyze task behavior:
+
+- **Duration Predictor** (Linear Regression): predicts execution time based on task duration and period
+- **Anomaly Detector** (Isolation Forest + business rules): flags workers with failure rate ≥ 50% or unusually long execution times
+
+Models train on-demand via `POST /ml/train-models` and are cached in memory after first load. Trained model files (`*.joblib`) are gitignored and regenerated automatically when missing.
+
+The anomaly detector combines ML with hard business rules because Isolation Forest requires diverse training data (some workers must already be anomalous to learn what "anomaly" looks like). With a homogeneous dataset of three healthy workers, the rules guarantee detection of obvious cases; the ML layer adds pattern recognition as more diverse data accumulates.
+
+### Structured JSON Logging
+
+All services use the Python standard `logging` module with a custom JSON formatter. Each log line is a JSON object with `timestamp`, `level`, `logger`, and `message` fields. This makes logs greppable, machine-parseable, and ready for ingestion into any log aggregator without extra configuration.
+
+Example:
+
+```json
+{"timestamp":"2026-10-26T09:42:58.679011+00:00","level":"INFO","logger":"app.warehouse.etl","message":"etl_run scanned=62 inserted=0 skipped=62"}
+```
 
 ## API Reference
 
@@ -164,6 +196,15 @@ Every fact row reflects a real task execution by a real worker.
 | GET | /analytics/tasks | Task statistics |
 | GET | /analytics/timeline | Time-series evolution |
 
+### AI
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /ml/predict-duration | Predict task execution time |
+| POST | /ml/detect-anomaly | Detect anomalous worker behavior |
+| POST | /ml/train-models | Retrain models on latest data |
+| GET | /ml/model-stats | Check model availability |
+
 ### System
 
 | Method | Path | Description |
@@ -191,7 +232,7 @@ Coverage includes:
 
 ## Data Warehouse
 
-The ETL job runs every sixty seconds. Example output from the analytics endpoint:
+The ETL job runs every thirty seconds. Example output from the analytics endpoint:
 
 ```json
 [
@@ -210,10 +251,12 @@ All numbers come from real worker activity.
 | Backend | FastAPI, Python 3.12, Pydantic v2 |
 | OLTP Database | MySQL 8.0 |
 | OLAP Database | Same MySQL instance, star schema |
-| Cache and Queue | Redis 7 (Lists, Pub/Sub, SETNX) |
+| Cache and Queue | Redis 7 (Lists, Pub/Sub, SETNX, Lua) |
 | Workers | Python asyncio with aioredis |
 | Frontend | React 19, TypeScript, Tailwind v4, Recharts |
 | Real-time | WebSocket with Redis Pub/Sub bridge |
+| ML | scikit-learn, joblib |
+| Logging | Python logging with custom JSON formatter |
 | Containerization | Docker and Docker Compose |
 | Testing | pytest and httpx |
 
@@ -222,13 +265,14 @@ All numbers come from real worker activity.
 ```text
 rt-dts/
   app/
-    api/           REST endpoints
-    core/          Settings and Redis client
+    api/           REST endpoints (tasks, scheduler, analytics, ml)
+    core/          Settings, Redis client, JSON logging
     db/            SQLAlchemy models (OLTP)
     scheduler/     RM, EDF, RTA algorithms
-    workers/       Worker, heartbeat, leader election
+    workers/       Worker, heartbeat, leader election, cleanup
     distributed/   Hash ring, retry policy, dead letter queue
     warehouse/     Star schema and ETL job
+    ml/            Duration predictor, anomaly detector
     ws/            WebSocket manager and bridge
   frontend/        React dashboard
   scripts/         Test scripts and utilities
@@ -240,10 +284,12 @@ rt-dts/
 ## What I Learned
 
 - Distributed systems are defined by independent failure, not by internet scale
-- Leader election requires careful TTL handling to avoid split-brain
+- Leader election requires atomic TTL handling to avoid split-brain; a Lua script beats a GET-then-EXPIRE sequence
 - Enum to database string conversion needs `.value`, otherwise silent bugs occur
 - SQLAlchemy accepts dynamic attributes without a Column, but they do not persist
 - Docker build context matters: reducing from 160 MB to 1.2 MB made builds fifteen times faster
+- Logging configuration must be set up in every process entry point, not just the main app
+- Machine learning needs diverse training data; business rules are a reliable safety net when the dataset is small
 
 ## Known Limitations
 
@@ -256,6 +302,9 @@ This is a portfolio project, not production software. The following limitations 
 - No CI/CD pipeline: tests run manually
 - No monitoring integration
 - Single-host deployment: designed for Docker Desktop on one machine
+- ML models train on limited data (three workers, uniform duration); business rules do the heavy lifting for anomaly detection
+- Scheduler algorithms (RM/EDF) are exposed as endpoints but not yet used by the worker loop, which currently uses FIFO via Redis lists
+- Consistent hash ring exists but is not yet wired into worker dispatch
 
 Each limitation is a clear next step for a future iteration.
 
